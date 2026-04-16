@@ -1,0 +1,73 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2869
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;\f1\fnil\fcharset0 AppleColorEmoji;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\paperw11900\paperh16840\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 from telegram import Update, ReplyKeyboardMarkup\
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes\
+\
+TOTAL = 0\
+\
+PRICES = \{\
+    "2": 2,\
+    "3.5": 3.5,\
+    "4.5": 4.5,\
+    "6": 6\
+\}\
+\
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):\
+    keyboard = [["Add", "Remove"]]\
+    await update.message.reply_text(\
+        "Welcome! Choose an action:",\
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)\
+    )\
+\
+async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):\
+    global TOTAL\
+    text = update.message.text\
+\
+    if text in ["Add", "Remove"]:\
+        context.user_data["action"] = text\
+        keyboard = [["2", "3.5"], ["4.5", "6"]]\
+        await update.message.reply_text(\
+            "Select price:",\
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)\
+        )\
+\
+    elif text in PRICES:\
+        context.user_data["price"] = PRICES[text]\
+        await update.message.reply_text("How many drinks?")\
+\
+    elif text.isdigit():\
+        qty = int(text)\
+        price = context.user_data.get("price", 0)\
+        action = context.user_data.get("action", "Add")\
+\
+        amount = qty * price\
+\
+        if action == "Add":\
+            TOTAL += amount\
+        else:\
+            TOTAL -= amount\
+\
+        msg = f"\{action\}ed \{qty\} drinks (\{amount\}\'80)\\nTotal: \{TOTAL:.2f\}\'80"\
+\
+        if TOTAL >= 300:\
+            msg += "\\n
+\f1 \uc0\u9888 \u65039 
+\f0  Budget exceeded!"\
+\
+        await update.message.reply_text(msg)\
+\
+import os\
+\
+TOKEN = os.getenv("BOT_TOKEN")\
+\
+app = ApplicationBuilder().token(TOKEN).build()\
+\
+app.add_handler(CommandHandler("start", start))\
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))\
+\
+app.run_polling()}
