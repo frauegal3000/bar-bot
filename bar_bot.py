@@ -6,6 +6,7 @@ A simple bot to track drink spending against an event budget.
 
 import os
 import logging
+from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -24,20 +25,22 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Conversation states
-AWAITING_BUDGET, MAIN_MENU, ADD_MENU, REMOVE_MENU, AWAITING_QUANTITY = range(5)
+(AWAITING_BUDGET, MAIN_MENU, ADD_MENU, REMOVE_MENU,
+ AWAITING_QUANTITY, SETTINGS_MENU, AWAITING_NEW_PRICE) = range(7)
 
-# Price tiers
-PRICE_TIERS = [2.0, 3.5, 4.5, 6.0]
+# Default price tiers
+DEFAULT_PRICES = [2.0, 3.5, 4.5, 6.0]
 
 # Session data (in-memory, resets on restart)
 session = {
     "budget": 0.0,
     "total": 0.0,
-    "items": {price: 0 for price in PRICE_TIERS},
+    "prices": DEFAULT_PRICES.copy(),  # Customizable prices
+    "items": {},  # Will be initialized based on prices
     "warning_sent": False,
     "threshold_sent": False,
     "active": False,
-    "pending_action": None,  # For "Add Multiple" flow
+    "pending_action": None,
     "pending_price": None,
 }
 
@@ -46,12 +49,19 @@ def reset_session():
     """Reset session to initial state."""
     session["budget"] = 0.0
     session["total"] = 0.0
-    session["items"] = {price: 0 for price in PRICE_TIERS}
+    session["prices"] = DEFAULT_PRICES.copy()
+    session["items"] = {price: 0 for price in session["prices"]}
     session["warning_sent"] = False
     session["threshold_sent"] = False
     session["active"] = False
     session["pending_action"] = None
     session["pending_price"] = None
+
+
+def ensure_price_in_items(price: float):
+    """Ensure a price tier exists in items dict."""
+    if price not in session["items"]:
+        session["items"][price] = 0
 
 
 def format_price(price: float) -> str:
@@ -70,6 +80,9 @@ def build_main_menu() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("📊 Summary", callback_data="menu_summary"),
+            InlineKeyboardButton("⚙️ Prices", callback_data="menu_settings"),
+        ],
+        [
             InlineKeyboardButton("🔄 New Session", callback_data="menu_new"),
         ],
     ]
@@ -78,25 +91,73 @@ def build_main_menu() -> InlineKeyboardMarkup:
 
 def build_price_menu(action: str) -> InlineKeyboardMarkup:
     """Build the price selection keyboard."""
+    # Create rows of up to 4 prices each
+    prices = sorted(session["prices"])
+    price_buttons = [
+        InlineKeyboardButton(format_price(price), callback_data=f"{action}_{price}")
+        for price in prices
+    ]
+
+    # Split into rows of 4
+    rows = []
+    for i in range(0, len(price_buttons), 4):
+        rows.append(price_buttons[i:i+4])
+
+    rows.append([
+        InlineKeyboardButton("Add Multiple...", callback_data=f"{action}_multiple"),
+        InlineKeyboardButton("← Back", callback_data="back_main"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_multiple_price_menu(action: str) -> InlineKeyboardMarkup:
+    """Build the price selection keyboard for multiple items."""
+    prices = sorted(session["prices"])
+    price_buttons = [
+        InlineKeyboardButton(format_price(price), callback_data=f"multi_{action}_{price}")
+        for price in prices
+    ]
+
+    rows = []
+    for i in range(0, len(price_buttons), 4):
+        rows.append(price_buttons[i:i+4])
+
+    rows.append([InlineKeyboardButton("← Back", callback_data=f"menu_{action}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_settings_menu() -> InlineKeyboardMarkup:
+    """Build the settings menu keyboard."""
+    prices_display = ", ".join(format_price(p) for p in sorted(session["prices"]))
     keyboard = [
-        [InlineKeyboardButton(format_price(price), callback_data=f"{action}_{price}")
-         for price in PRICE_TIERS],
         [
-            InlineKeyboardButton("Add Multiple...", callback_data=f"{action}_multiple"),
+            InlineKeyboardButton("➕ Add Price", callback_data="settings_add"),
+            InlineKeyboardButton("➖ Remove Price", callback_data="settings_remove"),
+        ],
+        [
+            InlineKeyboardButton("🔄 Reset to Default", callback_data="settings_reset"),
+        ],
+        [
             InlineKeyboardButton("← Back", callback_data="back_main"),
         ],
     ]
     return InlineKeyboardMarkup(keyboard)
 
 
-def build_multiple_price_menu(action: str) -> InlineKeyboardMarkup:
-    """Build the price selection keyboard for multiple items."""
-    keyboard = [
-        [InlineKeyboardButton(format_price(price), callback_data=f"multi_{action}_{price}")
-         for price in PRICE_TIERS],
-        [InlineKeyboardButton("← Back", callback_data=f"menu_{action}")],
+def build_remove_price_menu() -> InlineKeyboardMarkup:
+    """Build menu to select which price to remove."""
+    prices = sorted(session["prices"])
+    price_buttons = [
+        InlineKeyboardButton(f"❌ {format_price(price)}", callback_data=f"rmprice_{price}")
+        for price in prices
     ]
-    return InlineKeyboardMarkup(keyboard)
+
+    rows = []
+    for i in range(0, len(price_buttons), 3):
+        rows.append(price_buttons[i:i+3])
+
+    rows.append([InlineKeyboardButton("← Back", callback_data="menu_settings")])
+    return InlineKeyboardMarkup(rows)
 
 
 def build_confirmation_menu() -> InlineKeyboardMarkup:
@@ -119,6 +180,25 @@ def get_main_menu_text() -> str:
             "What would you like to do?"
         )
     return "No budget set. Use /start to begin."
+
+
+def get_log_message(action: str, quantity: int, price: float) -> str:
+    """Generate a log message for drink added/removed."""
+    timestamp = datetime.now().strftime("%H:%M")
+    total_cost = price * quantity
+    percentage = (session["total"] / session["budget"]) * 100 if session["budget"] > 0 else 0
+
+    if action == "add":
+        emoji = "🍺"
+        verb = "Added"
+    else:
+        emoji = "↩️"
+        verb = "Removed"
+
+    return (
+        f"{emoji} [{timestamp}] {verb} {quantity}x {format_price(price)} = {total_cost:.2f}€\n"
+        f"💰 Total: {session['total']:.2f}€ ({percentage:.1f}%)"
+    )
 
 
 async def check_and_send_alerts(update: Update) -> None:
@@ -166,8 +246,8 @@ def format_summary() -> str:
 
     # Item breakdown
     total_items = 0
-    for price in PRICE_TIERS:
-        count = session["items"][price]
+    for price in sorted(session["prices"]):
+        count = session["items"].get(price, 0)
         if count > 0:
             subtotal = price * count
             lines.append(f"  {format_price(price)}: {count}x = {subtotal:.2f}€")
@@ -207,6 +287,7 @@ async def receive_budget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         session["budget"] = budget
         session["active"] = True
+        session["items"] = {price: 0 for price in session["prices"]}
 
         await update.message.reply_text(
             f"✅ Budget set to {budget:.2f}€\n\n" + get_main_menu_text(),
@@ -255,6 +336,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return MAIN_MENU
 
+    elif data == "menu_settings":
+        prices_display = ", ".join(format_price(p) for p in sorted(session["prices"]))
+        await query.edit_message_text(
+            f"⚙️ *Price Settings*\n\nCurrent prices: {prices_display}",
+            reply_markup=build_settings_menu(),
+            parse_mode="Markdown"
+        )
+        return SETTINGS_MENU
+
     elif data == "menu_new":
         await query.edit_message_text(
             "🔄 *Start new session?*\n\nThis will clear all current data.",
@@ -278,14 +368,80 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return MAIN_MENU
 
+    # Settings handlers
+    elif data == "settings_add":
+        await query.edit_message_text(
+            "➕ *Add New Price*\n\nEnter the price in EUR (e.g., 5 or 3.50):",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("← Cancel", callback_data="menu_settings")]
+            ]),
+            parse_mode="Markdown"
+        )
+        return AWAITING_NEW_PRICE
+
+    elif data == "settings_remove":
+        if len(session["prices"]) <= 1:
+            await query.edit_message_text(
+                "❌ You need at least one price tier.\n\n⚙️ *Price Settings*",
+                reply_markup=build_settings_menu(),
+                parse_mode="Markdown"
+            )
+            return SETTINGS_MENU
+
+        await query.edit_message_text(
+            "➖ *Remove Price*\n\nSelect price to remove:",
+            reply_markup=build_remove_price_menu(),
+            parse_mode="Markdown"
+        )
+        return SETTINGS_MENU
+
+    elif data == "settings_reset":
+        session["prices"] = DEFAULT_PRICES.copy()
+        # Preserve counts for prices that still exist, reset others
+        new_items = {price: session["items"].get(price, 0) for price in session["prices"]}
+        session["items"] = new_items
+
+        prices_display = ", ".join(format_price(p) for p in sorted(session["prices"]))
+        await query.edit_message_text(
+            f"✅ Prices reset to default.\n\n⚙️ *Price Settings*\n\nCurrent prices: {prices_display}",
+            reply_markup=build_settings_menu(),
+            parse_mode="Markdown"
+        )
+        return SETTINGS_MENU
+
+    elif data.startswith("rmprice_"):
+        price = float(data.split("_")[1])
+        if price in session["prices"]:
+            session["prices"].remove(price)
+            # Remove from items but adjust total if there were items at this price
+            if price in session["items"]:
+                count = session["items"].pop(price)
+                if count > 0:
+                    session["total"] -= price * count
+                    session["total"] = max(0, session["total"])
+
+        prices_display = ", ".join(format_price(p) for p in sorted(session["prices"]))
+        await query.edit_message_text(
+            f"✅ Removed {format_price(price)}\n\n⚙️ *Price Settings*\n\nCurrent prices: {prices_display}",
+            reply_markup=build_settings_menu(),
+            parse_mode="Markdown"
+        )
+        return SETTINGS_MENU
+
     # Add single item
     elif data.startswith("add_") and not data.endswith("_multiple"):
         price = float(data.split("_")[1])
+        ensure_price_in_items(price)
         session["total"] += price
         session["items"][price] += 1
 
+        # Send log message
+        log_msg = get_log_message("add", 1, price)
+        await query.message.reply_text(log_msg)
+
+        # Update main menu
         await query.edit_message_text(
-            f"✅ Added 1x {format_price(price)}\n\n" + get_main_menu_text(),
+            get_main_menu_text(),
             reply_markup=build_main_menu()
         )
         await check_and_send_alerts(update)
@@ -294,15 +450,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # Remove single item
     elif data.startswith("remove_") and not data.endswith("_multiple"):
         price = float(data.split("_")[1])
+        ensure_price_in_items(price)
 
         if session["items"][price] > 0:
             session["total"] -= price
             session["items"][price] -= 1
-            # Ensure total doesn't go below 0 due to floating point
             session["total"] = max(0, session["total"])
 
+            # Send log message
+            log_msg = get_log_message("remove", 1, price)
+            await query.message.reply_text(log_msg)
+
             await query.edit_message_text(
-                f"✅ Removed 1x {format_price(price)}\n\n" + get_main_menu_text(),
+                get_main_menu_text(),
                 reply_markup=build_main_menu()
             )
         else:
@@ -350,6 +510,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         session["pending_action"] = "remove"
         session["pending_price"] = price
 
+        ensure_price_in_items(price)
         max_items = session["items"][price]
         await query.edit_message_text(
             f"➖ Removing {format_price(price)} drinks (max: {max_items})\n\nHow many?",
@@ -360,6 +521,44 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return AWAITING_QUANTITY
 
     return MAIN_MENU
+
+
+async def receive_new_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle new price input."""
+    try:
+        text = update.message.text.replace(",", ".").strip()
+        price = float(text)
+
+        if price <= 0:
+            await update.message.reply_text(
+                "❌ Please enter a positive number:"
+            )
+            return AWAITING_NEW_PRICE
+
+        if price in session["prices"]:
+            await update.message.reply_text(
+                f"❌ {format_price(price)} already exists. Enter a different price:"
+            )
+            return AWAITING_NEW_PRICE
+
+        # Add new price
+        session["prices"].append(price)
+        session["prices"].sort()
+        ensure_price_in_items(price)
+
+        prices_display = ", ".join(format_price(p) for p in sorted(session["prices"]))
+        await update.message.reply_text(
+            f"✅ Added {format_price(price)}\n\n⚙️ *Price Settings*\n\nCurrent prices: {prices_display}",
+            reply_markup=build_settings_menu(),
+            parse_mode="Markdown"
+        )
+        return SETTINGS_MENU
+
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Invalid price. Please enter a number (e.g., 5 or 3.50):"
+        )
+        return AWAITING_NEW_PRICE
 
 
 async def receive_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -375,14 +574,18 @@ async def receive_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         price = session["pending_price"]
         action = session["pending_action"]
+        ensure_price_in_items(price)
 
         if action == "add":
             session["total"] += price * quantity
             session["items"][price] += quantity
 
+            # Send log message
+            log_msg = get_log_message("add", quantity, price)
+            await update.message.reply_text(log_msg)
+
             await update.message.reply_text(
-                f"✅ Added {quantity}x {format_price(price)} ({price * quantity:.2f}€)\n\n"
-                + get_main_menu_text(),
+                get_main_menu_text(),
                 reply_markup=build_main_menu()
             )
             await check_and_send_alerts(update)
@@ -396,14 +599,18 @@ async def receive_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 session["items"][price] -= actual_quantity
                 session["total"] = max(0, session["total"])
 
-                msg = f"✅ Removed {actual_quantity}x {format_price(price)} ({price * actual_quantity:.2f}€)"
+                # Send log message
+                log_msg = get_log_message("remove", actual_quantity, price)
                 if actual_quantity < quantity:
-                    msg += f"\n(Only {max_items} were available)"
+                    log_msg += f"\n(Only {max_items} were available)"
+                await update.message.reply_text(log_msg)
             else:
-                msg = f"❌ No {format_price(price)} items to remove"
+                await update.message.reply_text(
+                    f"❌ No {format_price(price)} items to remove"
+                )
 
             await update.message.reply_text(
-                msg + "\n\n" + get_main_menu_text(),
+                get_main_menu_text(),
                 reply_markup=build_main_menu()
             )
 
@@ -462,6 +669,13 @@ def main() -> None:
                 CallbackQueryHandler(handle_callback),
             ],
             REMOVE_MENU: [
+                CallbackQueryHandler(handle_callback),
+            ],
+            SETTINGS_MENU: [
+                CallbackQueryHandler(handle_callback),
+            ],
+            AWAITING_NEW_PRICE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_new_price),
                 CallbackQueryHandler(handle_callback),
             ],
             AWAITING_QUANTITY: [
